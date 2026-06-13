@@ -15,84 +15,117 @@ class BandedLDLT:
     """
     def __init__(self, K, bw):
         """
-        K: 稠密对称正定矩阵
-        bw: 半带宽（包括对角线），即从对角线向左的非零元素个数
+        构造函数：将稠密对称正定矩阵 K 转换为压缩带状存储格式。
+
+        参数：
+            K : 二维numpy数组，稠密对称正定矩阵
+            bw: 半带宽（包括对角线），即从对角线向左的非零元素个数
         """
-        self.n = K.shape[0]
-        self.bw = bw                     # 注意：这里是 self.bw，不是 self.bandwidth
+        self.n = K.shape[0]                     # 矩阵维度
+        self.bw = bw                            # 保存半带宽，后面会用到
         # 初始化带状存储数组，形状 (n, bw)，初始为 0
         self.Aband = np.zeros((self.n, self.bw))
 
         # 将 K 的下半三角部分存入 Aband
-        for i in range(self.n):
+        for i in range(self.n):                 # 遍历每一行
+            # 对于第 i 行，只存储从第 max(0, i-bw+1) 列到第 i 列（包含对角线）
+            # 因为半带宽 bw 意味着从对角线向左最多 bw-1 个非零元素
             for j in range(max(0, i - self.bw + 1), i + 1):
-                # 列偏移 = i - j
+                # 列偏移 = i - j，范围 0 到 bw-1
+                # Aband[i, i-j] 存放原始矩阵中的 K[i, j]
                 self.Aband[i, i - j] = K[i, j]
 
     def factor(self):
         """
         带状矩阵的 LDL^T 分解，原地修改 Aband。
-        Aband[i, 0] 存储 D[i] (对角元)
-        Aband[i, k] (k>0) 存储 L[i, i-k] 乘以 D[i-k]？实际存储的是 L 元素。
-        算法参考：LDL^T 分解的带状版本。
+        分解后：
+            Aband[i, 0] 存放对角元 D[i]
+            Aband[i, k] (k>0) 存放 L[i, i-k]（即下三角部分 L 的原始值）
+        算法采用 LDL^T 分解的带状版本，充分利用半带宽减少计算量。
         """
         n = self.n
         bw = self.bw
-        Ab = self.Aband
+        Ab = self.Aband                         # 方便引用
 
+        # 主循环：按列处理，j 从 0 到 n-1
         for j in range(n):
-            # 计算 D[j]：Ab[j, 0] 初始为 K[j,j]，减去之前列的贡献
+            # ------------------------------------------------------------
+            # 1. 计算 D[j]（对角元），公式：d_j = A_jj - Σ_{k< j} (L_jk)^2 * d_k
+            # ------------------------------------------------------------
             sum_d = 0.0
-            # 只考虑 j 所在列的上方半带宽内的元素
+            # 只考虑 j 所在列的上方半带宽内的元素：k 从 max(0, j-bw+1) 到 j-1
             for k in range(max(0, j - bw + 1), j):
-                # L[j, k] = Ab[j, j - k]  注意：存储的索引为 (j, j-k)
-                # D[k] = Ab[k, 0]
+                # L[j, k] 存储在 Ab[j, j - k] （因为 j > k，偏移 j-k 在 1..bw-1 之间）
+                # D[k] 存储在 Ab[k, 0]
                 sum_d += Ab[j, j - k] ** 2 * Ab[k, 0]
-            Ab[j, 0] -= sum_d          # 更新后的 D[j]
+            # 减去累计和，得到新的 D[j]
+            Ab[j, 0] -= sum_d
 
+            # 检查对角元是否接近零（正定矩阵应大于0）
             if Ab[j, 0] <= 1e-12:
                 raise ValueError(f"零主元 at j={j}")
 
-            # 计算第 j 列下方元素 L[i, j] (i > j)
+            # ------------------------------------------------------------
+            # 2. 计算第 j 列下方的 L 元素（i > j）：L_ij = (A_ij - Σ_{k< j} L_ik * L_jk * d_k) / d_j
+            # ------------------------------------------------------------
+            # 只需考虑行 i 在 j+1 到 min(n-1, j+bw-1) 范围内，因为半带宽限制
             for i in range(j + 1, min(n, j + bw)):
                 sum_l = 0.0
-                # 遍历 k 从 max(0, i-bw+1, j-bw+1) 到 j-1
+                # 求和时 k 需要同时满足三个条件：
+                #   k < j, 
+                #   L_ik 非零 => i - k < bw  => k > i - bw
+                #   L_jk 非零 => j - k < bw  => k > j - bw
+                # 所以 k_start = max(0, i-bw+1, j-bw+1)（注意因为半带宽 bw 表示包括对角线，
+                # 所以索引偏移最大为 bw-1，因此下界为 k > i-bw => k >= i-bw+1）
                 k_start = max(0, i - bw + 1, j - bw + 1)
                 for k in range(k_start, j):
-                    # L[i, k] 存储在 Ab[i, i - k]
-                    # L[j, k] 存储在 Ab[j, j - k]
-                    # D[k] = Ab[k, 0]
+                    # L_ik 存储在 Ab[i, i - k]
+                    # L_jk 存储在 Ab[j, j - k]
+                    # D_k 存储在 Ab[k, 0]
                     sum_l += Ab[i, i - k] * Ab[j, j - k] * Ab[k, 0]
-                # L[i, j] = (K[i,j] - sum_l) / D[j]
-                # 注意 K[i,j] 存储在 Ab[i, i - j] 中（因为 i > j）
+                # 原始矩阵元素 A_ij（i>j）存储在 Ab[i, i - j]（因为 i - j 在 1..bw-1）
+                # 减去 sum_l 后除以 D[j]，得到 L_ij，并覆盖原存储位置
                 Ab[i, i - j] = (Ab[i, i - j] - sum_l) / Ab[j, 0]
 
     def solve(self, rhs):
         """
-        求解 K a = rhs，使用已分解的 LDL^T 带状矩阵。
-        前代：L y = rhs
-        对角：D z = y
-        回代：L^T a = z
+        求解线性方程组 K a = rhs，其中 K 已经完成 LDL^T 分解（factor() 已调用）。
+        使用三个步骤：
+            1. 前代：求解 L y = rhs
+            2. 对角缩放：求解 D z = y
+            3. 回代：求解 L^T a = z
+        参数：
+            rhs : 一维numpy数组，右端项
+        返回：
+            a   : 一维numpy数组，解向量
         """
         n = self.n
         bw = self.bw
         Ab = self.Aband
 
-        # 前代：解 L y = rhs
-        y = rhs.copy()
-        for i in range(n):
-            # 第 i 行，j 从 max(0, i-bw+1) 到 i-1
+        # ------------------------------------------------------------
+        # 前代：解 L y = rhs， y 与 rhs 同尺寸，原地更新 rhs 拷贝
+        # ------------------------------------------------------------
+        y = rhs.copy()                      # 复制右端项
+        for i in range(n):                  # 按行前进
+            # 第 i 行中，只在半带宽范围内的左侧元素 L[i, j] (j < i) 参与
             for j in range(max(0, i - bw + 1), i):
-                y[i] -= Ab[i, i - j] * y[j]
+                y[i] -= Ab[i, i - j] * y[j]   # 减去 L_ij * y_j
 
-        # 对角：z = y / D
+        # ------------------------------------------------------------
+        # 对角缩放：z = y / D，D 存储在 Ab[:, 0]
+        # ------------------------------------------------------------
         z = y / Ab[:, 0]
 
-        # 回代：解 L^T a = z
-        a = z.copy()
-        for i in range(n - 1, -1, -1):
+        # ------------------------------------------------------------
+        # 回代：解 L^T a = z，a 与 z 同尺寸，原地更新 z 拷贝
+        # ------------------------------------------------------------
+        a = z.copy()                        # 复制 z
+        for i in range(n - 1, -1, -1):      # 逆序遍历 i = n-1 ... 0
+            # 第 i 行中，L^T 的非零元素位于 L[j, i]（j > i），也即原下三角 L 的转置
+            # 这些元素存储在 Ab[j, j - i] 中（j > i 且 j - i < bw）
             for j in range(i + 1, min(n, i + bw)):
-                a[i] -= Ab[j, j - i] * a[j]
+                a[i] -= Ab[j, j - i] * a[j]   # 减去 L_ji * a_j
         return a
 
 
@@ -100,18 +133,18 @@ class BandedLDLT:
 # 示例运行
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
-    # 创建一个带状矩阵（例如三对角）
+    # 创建一个简单的三对角对称正定矩阵（例如二阶导数的离散化）
     n = 5
     K = np.zeros((n, n))
     for i in range(n):
-        K[i, i] = 2.0
+        K[i, i] = 2.0          # 对角线
         if i > 0:
-            K[i, i-1] = -1.0
-            K[i-1, i] = -1.0
-    # 半带宽 = 2（包括对角线）
-    solver = BandedLDLT(K, bw=2)          # 注意：参数名改为 bw
-    solver.factor()
-    rhs = np.array([1, 0, 0, 0, 0])
-    x = solver.solve(rhs)
+            K[i, i-1] = -1.0   # 下次对角线
+            K[i-1, i] = -1.0   # 对称性赋值
+    # 半带宽 = 2（包括对角线，即每条对角线加相邻一条副对角线）
+    solver = BandedLDLT(K, bw=2)          # 创建求解器对象，内部转为带状存储
+    solver.factor()                       # 执行 LDL^T 分解
+    rhs = np.array([1, 0, 0, 0, 0])       # 右端项
+    x = solver.solve(rhs)                 # 求解
     print("带状求解器结果:", x)
     print("对比直接求解:", np.linalg.solve(K, rhs))
